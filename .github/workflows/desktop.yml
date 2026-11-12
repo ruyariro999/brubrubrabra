@@ -1,0 +1,333 @@
+name: Build Stickman APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: SDK
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Tulis project
+        run: |
+          set -e
+          mkdir -p proj && cd proj
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'STICKEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+              <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions"/>
+              <application android:label="Stickman" android:icon="@android:drawable/sym_def_app_icon"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".OverlayService" android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="overlay pet"/>
+                  </service>
+                  <receiver android:name=".BootReceiver" android:exported="true">
+                      <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED"/></intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          STICKEOF
+          mkdir -p $(dirname app/src/main/java/com/ruya/stickman/MainActivity.java)
+          cat > app/src/main/java/com/ruya/stickman/MainActivity.java <<'STICKEOF'
+          package com.ruya.stickman;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.app.AppOpsManager;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Process;
+          import android.provider.Settings;
+          import android.widget.TextView;
+
+          public class MainActivity extends Activity {
+              TextView tv;
+
+              @Override protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  tv = new TextView(this);
+                  tv.setPadding(48, 96, 48, 48);
+                  tv.setTextSize(18);
+                  setContentView(tv);
+              }
+
+              boolean usageOk() {
+                  AppOpsManager ops = (AppOpsManager) getSystemService(Context.APP_OPS_SERVICE);
+                  return ops.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), getPackageName())
+                          == AppOpsManager.MODE_ALLOWED;
+              }
+
+              @Override protected void onResume() {
+                  super.onResume();
+                  if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != 0) {
+                      requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
+                      return;
+                  }
+                  if (!Settings.canDrawOverlays(this)) {
+                      tv.setText("Langkah 1: nyalakan 'Tampil di atas aplikasi lain' untuk Stickman, lalu tekan Back.");
+                      startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getPackageName())));
+                      return;
+                  }
+                  if (!usageOk()) {
+                      tv.setText("Langkah 2: nyalakan 'Akses penggunaan' untuk Stickman (biar dia tau kamu buka YouTube/TikTok), lalu tekan Back.");
+                      startActivity(new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS));
+                      return;
+                  }
+                  startForegroundService(new Intent(this, OverlayService.class));
+                  tv.setText("Stickman hidup. Aplikasi ini boleh ditutup.");
+                  finish();
+              }
+
+              @Override public void onRequestPermissionsResult(int c, String[] p, int[] r) { onResume(); }
+          }
+          STICKEOF
+          mkdir -p $(dirname app/src/main/java/com/ruya/stickman/OverlayService.java)
+          cat > app/src/main/java/com/ruya/stickman/OverlayService.java <<'STICKEOF'
+          package com.ruya.stickman;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.Service;
+          import android.app.usage.UsageEvents;
+          import android.app.usage.UsageStatsManager;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.Color;
+          import android.graphics.PixelFormat;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import org.json.JSONObject;
+
+          public class OverlayService extends Service {
+              WebView wv;
+              WindowManager wm;
+              final Handler h = new Handler(Looper.getMainLooper());
+
+              class Bridge {
+                  SharedPreferences sp() { return getSharedPreferences("stick", 0); }
+
+                  @JavascriptInterface public String load() {
+                      SharedPreferences p = sp();
+                      long now = System.currentTimeMillis();
+                      if (!p.contains("born")) p.edit().putLong("born", now).apply();
+                      String s = p.getString("s", null);
+                      try {
+                          JSONObject o = s == null ? new JSONObject() : new JSONObject(s);
+                          o.put("born", p.getLong("born", now)); // lahir tidak bisa diubah dari JS
+                          if (!o.has("seen")) o.put("seen", now);
+                          return o.toString();
+                      } catch (Exception e) { return "{\"born\":" + now + "}"; }
+                  }
+
+                  @JavascriptInterface public void save(String j) {
+                      try {
+                          JSONObject o = new JSONObject(j);
+                          o.put("born", sp().getLong("born", System.currentTimeMillis()));
+                          sp().edit().putString("s", o.toString()).apply();
+                      } catch (Exception e) {}
+                  }
+              }
+
+              String foreground() {
+                  try {
+                      UsageStatsManager u = (UsageStatsManager) getSystemService(Context.USAGE_STATS_SERVICE);
+                      long now = System.currentTimeMillis();
+                      UsageEvents ev = u.queryEvents(now - 12L * 3600 * 1000, now);
+                      UsageEvents.Event e = new UsageEvents.Event();
+                      String cur = null;
+                      while (ev.hasNextEvent()) {
+                          ev.getNextEvent(e);
+                          if (e.getEventType() == UsageEvents.Event.MOVE_TO_FOREGROUND) cur = e.getPackageName();
+                          else if (e.getEventType() == UsageEvents.Event.MOVE_TO_BACKGROUND && e.getPackageName().equals(cur)) cur = null;
+                      }
+                      return cur;
+                  } catch (Exception ex) { return null; }
+              }
+
+              final Runnable poll = new Runnable() {
+                  @Override public void run() {
+                      String p = foreground();
+                      String t = null;
+                      if ("com.google.android.youtube".equals(p)) t = "YouTube";
+                      else if ("com.zhiliaoapp.musically".equals(p) || "com.ss.android.ugc.trill".equals(p)) t = "TikTok";
+                      if (t != null && wv != null) wv.evaluateJavascript("window.onWatch&&window.onWatch('" + t + "')", null);
+                      h.postDelayed(this, 2500);
+                  }
+              };
+
+              @Override public IBinder onBind(Intent i) { return null; }
+
+              @Override public int onStartCommand(Intent i, int f, int id) {
+                  if (wv == null) start();
+                  return START_STICKY;
+              }
+
+              void start() {
+                  NotificationChannel c = new NotificationChannel("s", "Stickman", NotificationManager.IMPORTANCE_MIN);
+                  getSystemService(NotificationManager.class).createNotificationChannel(c);
+                  Notification n = new Notification.Builder(this, "s").setContentTitle("Stickman hidup")
+                          .setSmallIcon(android.R.drawable.star_on).build();
+                  if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+                  else startForeground(1, n);
+
+                  wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
+                  wv = new WebView(this);
+                  WebSettings s = wv.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  wv.setBackgroundColor(Color.TRANSPARENT);
+                  wv.setLayerType(View.LAYER_TYPE_SOFTWARE, null);
+                  wv.addJavascriptInterface(new Bridge(), "Android");
+                  wv.loadUrl("file:///android_asset/index.html");
+
+                  int hp = (int) (220 * getResources().getDisplayMetrics().density); // tinggi pita: ~2 baris ikon aplikasi
+                  WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                          WindowManager.LayoutParams.MATCH_PARENT, hp,
+                          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                          PixelFormat.TRANSLUCENT);
+                  lp.gravity = Gravity.BOTTOM;
+                  wm.addView(wv, lp);
+                  h.postDelayed(poll, 3000);
+              }
+
+              @Override public void onDestroy() {
+                  h.removeCallbacks(poll);
+                  if (wv != null) { wm.removeView(wv); wv.destroy(); wv = null; }
+                  super.onDestroy();
+              }
+          }
+          STICKEOF
+          mkdir -p $(dirname app/src/main/java/com/ruya/stickman/BootReceiver.java)
+          cat > app/src/main/java/com/ruya/stickman/BootReceiver.java <<'STICKEOF'
+          package com.ruya.stickman;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.provider.Settings;
+
+          public class BootReceiver extends BroadcastReceiver {
+              @Override public void onReceive(Context c, Intent i) {
+                  if (Settings.canDrawOverlays(c)) c.startForegroundService(new Intent(c, OverlayService.class));
+              }
+          }
+          STICKEOF
+          mkdir -p $(dirname app/src/main/assets/index.html)
+          cat > app/src/main/assets/index.html <<'STICKEOF'
+          <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <style>html,body{margin:0;height:100%;background:transparent;overflow:hidden}canvas{display:block;width:100vw;height:100vh}</style></head>
+          <body><canvas id="c"></canvas><script src="sim.js"></script>
+          <script>
+          const cv=document.getElementById('c'),ctx=cv.getContext('2d'),env={W:0,H:0,FL:0,Z:.75};
+          function rs(){const d=devicePixelRatio||1;env.W=innerWidth;env.H=innerHeight;cv.width=env.W*d;cv.height=env.H*d;ctx.setTransform(d,0,0,d,0,0);env.Z=Math.min(.75,env.H/280);env.FL=env.H-2}
+          addEventListener('resize',rs);rs();
+          let sim,tt=0;
+          const S=JSON.parse(window.Android.load());sim=createSim(env,S);sim.spawn();
+          window.onWatch=t=>sim.watch(t);
+          setInterval(()=>window.Android.save(JSON.stringify(S)),10000);
+          let last=performance.now(),acc=0;
+          (function loop(n){acc+=Math.min(.1,(n-last)/1e3);last=n;while(acc>=1/60){sim.step();sim.tick(1/60);acc-=1/60}draw();requestAnimationFrame(loop)})(last);
+          function draw(){
+           ctx.clearRect(0,0,env.W,env.H);tt++;
+           const P=sim.P,SG=sim.SG,m=sim.mood,f=sim.f,s=sim.size(),a=sim.age(),lw=Math.max(2.5,6.5*s);
+           ctx.lineCap='round';ctx.strokeStyle='#000';ctx.fillStyle='#000';
+           for(let i=1;i<15;i++){const q=SG[i],A=P[q[1]],B=P[q[2]];ctx.lineWidth=i<3?lw*1.5:lw;ctx.beginPath();ctx.moveTo(A.x,A.y);ctx.lineTo(B.x,B.y);ctx.stroke()}
+           for(const j of[6,9]){ctx.beginPath();ctx.arc(P[j].x,P[j].y,lw*.7,0,7);ctx.fill()}
+           const R=s*(14+(10-a)*.7),h=P[0],n=P[1],ang=Math.atan2(h.y-n.y,h.x-n.x);
+           ctx.save();ctx.translate(h.x,h.y);ctx.rotate(ang+Math.PI/2);ctx.beginPath();ctx.arc(0,0,R,0,7);ctx.fill();
+           const r=R*.34*(1+.35*m.p),sh=m.p>.3?Math.sin(tt*1.7)*R*.04:0,up=sim.mode=='watch'?-R*.15:0;ctx.fillStyle='#fff';
+           for(const sg of[-1,1]){ctx.beginPath();ctx.arc(sg*R*.42+f*R*.1+sh,-R*.05+up,r,0,7);ctx.fill()}
+           if(m.a>.15){ctx.fillStyle='#000';for(const sg of[-1,1]){const ex=sg*R*.42+f*R*.1,ey=-R*.05+up;ctx.beginPath();ctx.moveTo(ex+sg*r*1.4,ey-r*1.4);ctx.lineTo(ex-sg*r*1.4,ey-r*1.4);ctx.lineTo(ex-sg*r*1.4,ey-r*1.4+r*1.9*m.a);ctx.fill()}}
+           ctx.restore();
+          }
+          </script></body></html>
+          STICKEOF
+          mkdir -p $(dirname app/src/main/assets/sim.js)
+          cat > app/src/main/assets/sim.js <<'STICKEOF'
+          // Fisika + otak stickman. 16 titik, 15 segmen R15, 15 bot (1 per segmen), 1 otak (think).
+          (function(root){
+          function createSim(env,S){
+          const D=Math.PI/180,clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+          const SG=[['Head',1,0,26],['UpperTorso',2,1,40],['LowerTorso',3,2,36],['L.UpperArm',1,4,34],['L.LowerArm',4,5,30],['L.Hand',5,6,12],['R.UpperArm',1,7,34],['R.LowerArm',7,8,30],['R.Hand',8,9,12],['L.UpperLeg',3,10,46],['L.LowerLeg',10,11,44],['L.Foot',11,12,18],['R.UpperLeg',3,13,46],['R.LowerLeg',13,14,44],['R.Foot',14,15,18]];
+          const BK=[.2,.3,.3,.12,.1,.06,.12,.1,.06,.3,.3,.2,.3,.3,.2];
+          const POSE={stand:[-90,-90,-90,90,90,90,90,90,90,90,90,0,90,90,0],
+           crawl:[-35,-25,-20,80,90,90,80,90,90,20,140,180,20,140,180],
+           sit:[-90,-90,-90,90,90,90,90,90,90,0,0,-70,0,0,-70],
+           fly:[-5,-5,-5,-5,-5,-5,-5,-5,-5,170,175,180,170,175,180]};
+          const MIN={crawl:0,bal:1,walk:2,run:4,fly:10},ORD=['crawl','bal','walk','run','fly'];
+          const KEYS=[[/lari|run|sprint|jogging/i,'run'],[/jalan|walk|walking/i,'walk'],[/berdiri|stand|balance/i,'bal'],[/merangkak|crawl|baby/i,'crawl'],[/terbang|fly|flying|superman/i,'fly']];
+          const ANGRY=/marah|angry|rage|tantrum|emosi|fight|berantem/i,SCARY=/horror|scary|jumpscare|hantu|seram|panik|panic/i;
+          S.sk=Object.assign({crawl:0,bal:0,walk:0,run:0,fly:0},S.sk||{});
+          S.par=Object.assign({sw:.5,kn:.5,ln:.3,fq:1},S.par||{});
+          const age=()=>Math.min(10,(Math.max(Date.now(),S.seen||0)-S.born)/864e5);
+          const sc=()=>(.35+.65*age()/10)*env.Z;
+          const cap=s=>age()>=MIN[s]?Math.min(1,.45+(age()-MIN[s])*.3):0;
+          const learnTarget=()=>ORD.find(s=>S.sk[s]<cap(s)-.001);
+          const sim={SG,S,age,cap,mood:{a:0,p:0},err:Array(15).fill(0),P:[],mode:'rag',f:1,flying:false,drag:-1,watching:'',lastLesson:''};
+          let flyT=25,L=[],cur=POSE.stand.slice(),T=[],K=[],ph=0,tt=0,goal=300,goalT=0,fallT=0,tantT=25,thr=0,watchT=0,dx=0,dy=0;
+          let tr={d:0,fl:0,t:0,best:-1e9,x:0};
+          sim.spawn=function(){const s=sc(),P=sim.P=Array.from({length:16},()=>({x:0,y:0,px:0,py:0}));P[3].x=env.W/2;P[3].y=env.FL-4;
+          const lay=[0,0,0,100,100,100,100,100,100,180,180,180,180,180,180];
+          [2,1,0,3,4,5,6,7,8,9,10,11,12,13,14].forEach(i=>{const q=SG[i],a=P[q[1]],b=P[q[2]],g=lay[i]*D;b.x=a.x+Math.cos(g)*q[3]*s;b.y=a.y+Math.sin(g)*q[3]*s});
+          P.forEach(p=>{p.px=p.x;p.py=p.y});if(S.sk.bal>.3)fallT=3};
+          sim.grab=function(i){sim.drag=i};sim.moveTo=function(x,y){dx=x;dy=y};sim.release=function(){sim.drag=-1};
+          sim.watch=function(title){watchT=6;sim.watching=title;sim.titleKey=null;for(const[r,s]of KEYS)if(r.test(title)){sim.titleKey=s;break}
+          sim.titleAngry=ANGRY.test(title);sim.titleScary=SCARY.test(title)};
+          function think(){const P=sim.P,s=sc(),k=S.sk,hip=P[3],dist=goal-hip.x,pn=sim.mood.p,rebel=sim.mood.a>.6,a=age();
+          if(Math.abs(dist)>25)sim.f=dist>0?1:-1;const f=sim.f;let m,sq;
+          const watching=watchT>0&&!rebel&&sim.drag<0;
+          if(sim.flying&&a>=10){m='fly';sq=Math.max(.6,k.fly)}
+          else if(fallT>0){m=k.bal>.3?'getup':'crawl';sq=m=='getup'?k.bal:Math.max(k.crawl,.5)}
+          else if(watching&&k.bal>.3){m='watch';sq=k.bal}
+          else if(k.bal>.3&&k.walk>.3){m=((Math.abs(dist)>350*env.Z||pn>.4)&&k.run>.4)?'run':'walk';sq=m=='run'?k.run:k.walk;if(Math.abs(dist)<30||rebel){m=rebel?'stomp':'stand';sq=k.bal}}
+          else if(k.bal>.3){m=rebel?'stomp':'stand';sq=k.bal}
+          else if(k.crawl>.3){m='crawl';sq=k.crawl}else{m='rag';sq=0}
+          if((m=='walk'||m=='run'||m=='stand'||m=='stomp')&&hip.y-P[0].y<40*s){fallT=2;sim.mood.p=Math.min(1,pn+.5);sim.mood.a=Math.min(1,sim.mood.a+.2);tr.fl++;m='crawl';sq=Math.max(k.crawl,.5)}
+          sim.mode=m;
+          const tg=m=='fly'?POSE.fly:(m=='crawl'||m=='rag')?POSE.crawl:m=='watch'?POSE.sit:POSE.stand;for(let i=0;i<15;i++)cur[i]+=(tg[i]-cur[i])*.04;
+          const o=cur.slice(),p=S.par;ph+=(m=='run'?.14:m=='crawl'?.06:m=='stomp'?.12:.08)*p.fq*(1+pn*1.2);
+          const lean=m=='run'?18+p.ln*40:m=='walk'?4+p.ln*30:0;
+          if(m=='walk'||m=='run'){const A=(m=='run'?42:24)*(.6+p.sw*.8),B=(m=='run'?70:40)*(.6+p.kn*.8);
+          o[0]=-90+lean*.5;o[1]=o[2]=-90+lean;
+          [[9,0],[12,Math.PI]].forEach(([i,z])=>{const sn=Math.sin(ph+z),cs=Math.cos(ph+z),ul=90-A*sn;o[i]=ul;o[i+1]=ul+B*Math.max(0,cs);o[i+2]=(o[i+1]-90)*.25});
+          [[3,Math.PI],[6,0]].forEach(([i,z])=>{const ua=90-A*.8*Math.sin(ph+z);o[i]=ua;o[i+1]=o[i+2]=ua-25})}
+          else if(m=='crawl'){o[3]=80+25*Math.sin(ph);o[6]=80+25*Math.sin(ph+Math.PI);o[9]=20+15*Math.sin(ph+Math.PI);o[12]=20+15*Math.sin(ph)}
+          else if(m=='stomp'){for(const i of[3,6]){o[i]=-50+20*Math.sin(ph*3+i);o[i+1]=-70+25*Math.sin(ph*3+i);o[i+2]=o[i+1]}
+          o[9]=90-35*Math
